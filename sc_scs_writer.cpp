@@ -1,9 +1,3 @@
-/*
- * This source file is part of an OSTIS project. For the latest info, see http://ostis.net
- * Distributed under the MIT License
- * (See accompanying file COPYING.MIT or copy at http://opensource.org/licenses/MIT)
- */
-
 #include "sc_scs_writer.hpp"
 
 #include <regex>
@@ -12,6 +6,7 @@
 
 #include "sc_scg_element.hpp"
 #include "sc_scs_element.hpp"
+#include "sc_scg_to_scs_types_converter.hpp"
 
 using namespace Constants;
 
@@ -93,80 +88,99 @@ void SCsWriter::SCgIdentifierCorrector::GenerateSCsIdentifier(
 }
 
 void SCsWriter::Write(
-    SCgElements const & elements,
-    std::string const & filePath,
-    Buffer & buffer,
-    size_t depth,
-    std::unordered_set<SCgElementPtr> & writtenElements)
+  SCgElements const & elements,
+  std::string const & filePath,
+  Buffer & buffer,
+  size_t depth,
+  std::unordered_set<SCgElementPtr> & writtenElements)
 {
-  std::list<SCgElementPtr> dependedConnectors;
-
-  auto it = elements.cbegin();
-  while (it != elements.cend())
+// Step 1: Write all nodes with their types
+for (auto const & [id, element] : elements)
+{
+  if (element->GetTag() == NODE)
   {
-    SCgElementPtr scgElement = it->second;
+    if (writtenElements.count(element)) continue;
+    writtenElements.insert(element);
 
-    bool isElementWritable = true;
-    std::string const & scgTag = scgElement->GetTag();
-    if (scgTag == BUS)
-      isElementWritable = false;
-    else if (scgTag == PAIR || scgTag == ARC)
+    std::string identifier = element->GetIdentifier();
+    if (identifier.empty())
     {
-      auto scgConnector = std::dynamic_pointer_cast<SCgConnector>(scgElement);
-      auto const & source = scgConnector->GetSource();
-      auto const & target = scgConnector->GetTarget();
-
-      if (writtenElements.find(source) == writtenElements.cend()
-          || writtenElements.find(target) == writtenElements.cend())
-      {
-        dependedConnectors.push_back(scgElement);
-        isElementWritable = false;
-      }
+      identifier = "node_" + element->GetId();
     }
-
-    if (isElementWritable)
-    {
-      auto const & scsElement = SCsElementFactory::CreateSCsElementForSCgElement(scgElement);
-      scsElement->ConvertFromSCgElement(scgElement);
-      scsElement->Dump(filePath, buffer, depth, writtenElements);
-      writtenElements.insert(scgElement);
-    }
-
-    ++it;
+    buffer.AddTabs(depth) << identifier << "\n";
+    std::string elementTypeStr;
+    SCgToSCsTypesConverter::ConvertSCgNodeTypeToSCsNodeType(element->GetType(), elementTypeStr);
+    if (elementTypeStr.empty()) elementTypeStr = "node_";
+      buffer.AddTabs(depth + 1) << "<- " << elementTypeStr << ";;\n";
   }
-  if (!dependedConnectors.empty())
+}
+
+// Step 2: Write relationships based on arcs
+for (auto const & [id, element] : elements)
+{
+  if (element->GetTag() == ARC || element->GetTag() == PAIR)
   {
-    size_t connectorsWrittenOnPreviousIteration = dependedConnectors.size();
-    while (connectorsWrittenOnPreviousIteration != 0)
+    if (writtenElements.count(element)) continue;
+    writtenElements.insert(element);
+
+    auto connector = std::dynamic_pointer_cast<SCgConnector>(element);
+    std::string sourceId = connector->GetSource()->GetIdentifier();
+    std::string targetId = connector->GetTarget()->GetIdentifier();
+    if (sourceId.empty()) sourceId = "node_" + connector->GetSource()->GetId();
+    if (targetId.empty()) targetId = "node_" + connector->GetTarget()->GetId();
+
+    std::string relation = connector->GetType();
+    if (relation.find("nrel_") == 0 || relation.find("rel_") == 0)
     {
-      connectorsWrittenOnPreviousIteration = 0;
-      for (auto dependedConnector = dependedConnectors.cbegin(); dependedConnector != dependedConnectors.cend();)
+      std::string direction = "=>";
+      if (connector->GetSource() != element && connector->GetTarget() == element)
       {
-        auto scgConnector = std::dynamic_pointer_cast<SCgConnector>(*dependedConnector);
-        auto const & source = scgConnector->GetSource();
-        auto const & target = scgConnector->GetTarget();
-        bool isElementWritable =
-            (writtenElements.find(source) != writtenElements.cend()
-             && writtenElements.find(target) != writtenElements.cend());
-        if (isElementWritable)
-        {
-          auto const & scsElement = SCsElementFactory::CreateSCsElementForSCgElement(*dependedConnector);
-          scsElement->ConvertFromSCgElement(*dependedConnector);
-          scsElement->Dump(filePath, buffer, depth, writtenElements);
-          writtenElements.insert(*dependedConnector);
-          ++connectorsWrittenOnPreviousIteration;
-          dependedConnector = dependedConnectors.erase(dependedConnector);
-        }
-        else
-          ++dependedConnector;
+        direction = "<=";
       }
+      buffer.AddTabs(depth) << sourceId << " " << direction << " " << relation << ": " << targetId << ";;\n";
+    }
+    else
+    {
+      std::string connectorSymbol;
+      SCgToSCsTypesConverter::ConvertSCgConnectorTypeToSCsConnectorDesignation(connector->GetType(), connectorSymbol);
+      if (connectorSymbol.empty()) connectorSymbol = "->";
+      buffer.AddTabs(depth) << sourceId << " " << connectorSymbol << " " << targetId << ";;\n";
     }
   }
-  if (!dependedConnectors.empty())
-    SC_THROW_EXCEPTION(
-        utils::ExceptionInvalidState,
-        "SCsWriter: unknown incident elements for " << dependedConnectors.size() << " connectors at `" << filePath
-                                                    << "`.");
+}
+
+// Step 3: Write contours as structures
+for (auto const & [id, element] : elements)
+{
+  if (element->GetTag() == CONTOUR)
+  {
+    if (writtenElements.count(element)) continue;
+    writtenElements.insert(element);
+
+    auto contour = std::dynamic_pointer_cast<SCgContour>(element);
+    std::string identifier = element->GetIdentifier();
+    if (identifier.empty())
+    {
+      identifier = "contour_" + element->GetId();
+    }
+    buffer.AddTabs(depth) << identifier << " = [*\n";
+    Write(contour->GetElements(), filePath, buffer, depth + 1, writtenElements);
+    buffer.AddTabs(depth) << "*];;\n";
+  }
+  else if (element->GetTag() == BUS)
+  {
+    if (writtenElements.count(element)) continue;
+    writtenElements.insert(element);
+
+    std::string identifier = element->GetIdentifier();
+    if (identifier.empty())
+    {
+      identifier = "bus_" + element->GetId();
+    }
+    buffer.AddTabs(depth) << identifier << "\n";
+    buffer.AddTabs(depth + 1) << "<- " << element->GetType() << ";;\n";
+  }
+}
 }
 
 void SCsWriter::WriteMainIdentifier(
