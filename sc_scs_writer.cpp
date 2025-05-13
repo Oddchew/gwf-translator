@@ -1,6 +1,7 @@
 #include "sc_scs_writer.hpp"
 
 #include <regex>
+#include <string>
 
 #include <sc-memory/sc_utils.hpp>
 
@@ -87,6 +88,27 @@ void SCsWriter::SCgIdentifierCorrector::GenerateSCsIdentifier(
     scsElement->SetIdentifierForSCs(SCsWriter::MakeAlias(CONNECTOR, id));
 }
 
+// Вспомогательная функция для рекурсивного сбора узлов
+void SCsWriter::CollectNodes(
+    SCgElements const & elements,
+    std::unordered_set<SCgElementPtr> & nodes,
+    std::unordered_set<SCgElementPtr> & visitedContours)
+{
+  for (auto const & [id, element] : elements)
+  {
+    if (element->GetTag() == NODE)
+    {
+      nodes.insert(element);
+    }
+    else if (element->GetTag() == CONTOUR && !visitedContours.count(element))
+    {
+      visitedContours.insert(element);
+      auto contour = std::dynamic_pointer_cast<SCgContour>(element);
+      CollectNodes(contour->GetElements(), nodes, visitedContours);
+    }
+  }
+}
+
 void SCsWriter::Write(
   SCgElements const & elements,
   std::string const & filePath,
@@ -94,93 +116,114 @@ void SCsWriter::Write(
   size_t depth,
   std::unordered_set<SCgElementPtr> & writtenElements)
 {
-// Step 1: Write all nodes with their types
-for (auto const & [id, element] : elements)
-{
-  if (element->GetTag() == NODE)
-  {
-    if (writtenElements.count(element)) continue;
-    writtenElements.insert(element);
+  // Шаг 1: Сбор всех узлов, включая вложенные в контуры
+  std::unordered_set<SCgElementPtr> allNodes;
+  std::unordered_set<SCgElementPtr> visitedContours;
+  CollectNodes(elements, allNodes, visitedContours);
 
-    std::string identifier = element->GetIdentifier();
-    if (identifier.empty())
-    {
-      identifier = "node_" + element->GetId();
-    }
+  // Запись типов всех узлов
+  for (auto const & node : allNodes)
+  {
+    if (writtenElements.count(node)) continue;
+    writtenElements.insert(node);
+    std::string identifier = node->GetIdentifier();
+    if (identifier.empty()) identifier = "node_" + node->GetId();
     buffer.AddTabs(depth) << identifier << "\n";
     std::string elementTypeStr;
-    SCgToSCsTypesConverter::ConvertSCgNodeTypeToSCsNodeType(element->GetType(), elementTypeStr);
+    SCgToSCsTypesConverter::ConvertSCgNodeTypeToSCsNodeType(node->GetType(), elementTypeStr);
     if (elementTypeStr.empty()) elementTypeStr = "node_";
-      buffer.AddTabs(depth + 1) << "<- " << elementTypeStr << ";;\n";
+    buffer.AddTabs(depth + 1) << "<- " << elementTypeStr << ";;\n\n";
   }
-}
 
-// Step 2: Write relationships based on arcs
-for (auto const & [id, element] : elements)
-{
-  if (element->GetTag() == ARC || element->GetTag() == PAIR)
+  // Шаг 2: Предварительная обработка для дуг
+  std::unordered_set<SCgElementPtr> complexArcs;
+  std::unordered_set<SCgElementPtr> attributeArcs;
+  for (auto const & [id, element] : elements)
   {
-    if (writtenElements.count(element)) continue;
-    writtenElements.insert(element);
-
-    auto connector = std::dynamic_pointer_cast<SCgConnector>(element);
-    std::string sourceId = connector->GetSource()->GetIdentifier();
-    std::string targetId = connector->GetTarget()->GetIdentifier();
-    if (sourceId.empty()) sourceId = "node_" + connector->GetSource()->GetId();
-    if (targetId.empty()) targetId = "node_" + connector->GetTarget()->GetId();
-
-    std::string relation = connector->GetType();
-    if (relation.find("nrel_") == 0 || relation.find("rel_") == 0)
+    if (element->GetTag() == ARC || element->GetTag() == PAIR)
     {
-      std::string direction = "=>";
-      if (connector->GetSource() != element && connector->GetTarget() == element)
+      auto connector = std::dynamic_pointer_cast<SCgConnector>(element);
+      auto target = connector->GetTarget();
+      if (target->GetTag() == ARC || target->GetTag() == PAIR)
       {
-        direction = "<=";
+        complexArcs.insert(target);
+        attributeArcs.insert(element);
       }
-      buffer.AddTabs(depth) << sourceId << " " << direction << " " << relation << ": " << targetId << ";;\n";
-    }
-    else
-    {
-      std::string connectorSymbol;
-      SCgToSCsTypesConverter::ConvertSCgConnectorTypeToSCsConnectorDesignation(connector->GetType(), connectorSymbol);
-      if (connectorSymbol.empty()) connectorSymbol = "->";
-      buffer.AddTabs(depth) << sourceId << " " << connectorSymbol << " " << targetId << ";;\n";
     }
   }
-}
 
-// Step 3: Write contours as structures
-for (auto const & [id, element] : elements)
-{
-  if (element->GetTag() == CONTOUR)
+  // Шаг 3: Запись дуг и пар
+  for (auto const & [id, element] : elements)
   {
-    if (writtenElements.count(element)) continue;
-    writtenElements.insert(element);
-
-    auto contour = std::dynamic_pointer_cast<SCgContour>(element);
-    std::string identifier = element->GetIdentifier();
-    if (identifier.empty())
+    if (element->GetTag() == ARC || element->GetTag() == PAIR)
     {
-      identifier = "contour_" + element->GetId();
+      if (writtenElements.count(element)) continue;
+      if (attributeArcs.count(element)) continue;
+      writtenElements.insert(element);
+
+      auto connector = std::dynamic_pointer_cast<SCgConnector>(element);
+      std::string sourceId = connector->GetSource()->GetIdentifier();
+      std::string targetId = connector->GetTarget()->GetIdentifier();
+      if (sourceId.empty()) sourceId = "node_" + connector->GetSource()->GetId();
+      if (targetId.empty()) targetId = "node_" + connector->GetTarget()->GetId();
+
+      if (complexArcs.count(element))
+      {
+        std::string attrSourceId;
+        for (auto const & [incomingId, incomingElement] : elements)
+        {
+          if (incomingElement->GetTag() == ARC || incomingElement->GetTag() == PAIR)
+          {
+            auto incConnector = std::dynamic_pointer_cast<SCgConnector>(incomingElement);
+            if (incConnector->GetTarget() == element)
+            {
+              attrSourceId = incConnector->GetSource()->GetIdentifier();
+              if (attrSourceId.empty()) attrSourceId = "node_" + incConnector->GetSource()->GetId();
+              break;
+            }
+          }
+        }
+
+        if (!attrSourceId.empty())
+        {
+          std::string connectorSymbol;
+          SCgToSCsTypesConverter::ConvertSCgConnectorTypeToSCsConnectorDesignation(connector->GetType(), connectorSymbol);
+          if (connectorSymbol.empty()) connectorSymbol = "->";
+          buffer.AddTabs(depth) << sourceId << " " << connectorSymbol << " " << attrSourceId << ": " << targetId << ";;\n\n";
+        }
+        else
+        {
+          std::string connectorSymbol;
+          SCgToSCsTypesConverter::ConvertSCgConnectorTypeToSCsConnectorDesignation(connector->GetType(), connectorSymbol);
+          if (connectorSymbol.empty()) connectorSymbol = "->";
+          buffer.AddTabs(depth) << sourceId << " " << connectorSymbol << " " << targetId << ";;\n\n";
+        }
+      }
+      else
+      {
+        std::string connectorSymbol;
+        SCgToSCsTypesConverter::ConvertSCgConnectorTypeToSCsConnectorDesignation(connector->GetType(), connectorSymbol);
+        if (connectorSymbol.empty()) connectorSymbol = "->";
+        buffer.AddTabs(depth) << sourceId << " " << connectorSymbol << " " << targetId << ";;\n\n";
+      }
     }
-    buffer.AddTabs(depth) << identifier << " = [*\n";
-    Write(contour->GetElements(), filePath, buffer, depth + 1, writtenElements);
-    buffer.AddTabs(depth) << "*];;\n";
   }
-  else if (element->GetTag() == BUS)
+
+  // Шаг 4: Запись контуров (без повторной записи узлов)
+  for (auto const & [id, element] : elements)
   {
-    if (writtenElements.count(element)) continue;
-    writtenElements.insert(element);
-
-    std::string identifier = element->GetIdentifier();
-    if (identifier.empty())
+    if (element->GetTag() == CONTOUR)
     {
-      identifier = "bus_" + element->GetId();
+      if (writtenElements.count(element)) continue;
+      writtenElements.insert(element);
+      auto contour = std::dynamic_pointer_cast<SCgContour>(element);
+      std::string identifier = element->GetIdentifier();
+      if (identifier.empty()) identifier = "contour_" + element->GetId();
+      buffer.AddTabs(depth) << identifier << " = [*\n";
+      Write(contour->GetElements(), filePath, buffer, depth + 1, writtenElements);
+      buffer.AddTabs(depth) << "*];;\n\n";
     }
-    buffer.AddTabs(depth) << identifier << "\n";
-    buffer.AddTabs(depth + 1) << "<- " << element->GetType() << ";;\n";
   }
-}
 }
 
 void SCsWriter::WriteMainIdentifier(
